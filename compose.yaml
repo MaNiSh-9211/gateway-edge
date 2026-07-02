@@ -1,0 +1,10 @@
+services:
+  gateway-edge:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      GATEWAY_REGION: GLOBAL
+      GATEWAY_CONFIG_PATH: /etc/gateway/config.json
+      REDIS_HOST: redis
+      CONTROL_PLANE_URL: http://control-plane:8081
