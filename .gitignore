@@ -1,4 +1,5 @@
 ﻿# Real credentials â€” NEVER commit. Copy .env.example â†’ .env.dev locally.
+.env
 .env.dev
 .env.local
 
