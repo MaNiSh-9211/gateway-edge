@@ -2,6 +2,9 @@
 # Single-container Render/K8s pattern: config-sidecar + OpenResty gateway (ADR-0052).
 set -e
 
+echo "=== RENDER INTERNAL HOSTNAME ==="
+echo "GATEWAY_INTERNAL_HOST: ${RENDER_DISCOVERY_NAME:-not-set}"
+echo "================================"
 CONFIG_PATH="${GATEWAY_CONFIG_PATH:-/etc/gateway/config.json}"
 OPENRESTY="/usr/local/openresty/bin/openresty"
 SIDECAR="/usr/local/bin/config-sidecar"
