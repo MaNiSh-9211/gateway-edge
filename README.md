@@ -34,6 +34,10 @@ docker run --rm -p 8080:8080 \
 
 Set env vars in the Render dashboard (see `.env.example`). **Do not deploy `gateway-sidecar` separately** — it runs inside this container.
 
+**Render gotchas:**
+- `CONFIG_READ_TOKEN` must **exactly match** `gateway-control-plane` (otherwise sidecar gets 401 on `/config`).
+- Set service **Port to `8080`** (or `METRICS_PORT=0`) so Render does not auto-detect sidecar metrics on `9092`.
+
 HTTPS upstreams (`host:443` from control-plane) are supported for Render backends (`*.onrender.com`).
 
 ## Production (Kubernetes)

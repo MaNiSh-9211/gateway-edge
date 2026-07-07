@@ -143,7 +143,15 @@ function M.access()
         if code == 429 or code == 503 then
             ngx.header["Retry-After"] = "1"
         end
-        ngx.say(ERROR_BODIES[code] or '{"error":"Request rejected"}')
+        local body = ERROR_BODIES[code] or '{"error":"Request rejected"}'
+        -- For server errors (5xx), attach a stack trace for debugging
+        if code >= 500 then
+            local stack = debug.traceback()
+            ngx.log(ngx.ERR, "Gateway error (", code, "): ", body, " stack: ", stack)
+            local json = require "cjson"
+            body = json.encode({ error = body:match('"error":"([^"]+)"'), stack = stack })
+        end
+        ngx.say(body)
         return ngx.exit(code)
     end
 

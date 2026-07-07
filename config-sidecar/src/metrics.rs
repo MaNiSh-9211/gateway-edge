@@ -51,9 +51,12 @@ fn handle_connection(mut stream: std::net::TcpStream) {
 }
 
 /// Minimal Prometheus scrape server for internal Docker/K8s networks.
-pub fn spawn_metrics_server(port: u16) {
+/// Bind to `127.0.0.1` on Render (`METRICS_BIND=127.0.0.1`) so the platform
+/// does not treat metrics as the public web port.
+pub fn spawn_metrics_server(bind: &str, port: u16) {
+    let bind = bind.to_string();
     std::thread::spawn(move || {
-        let addr = format!("0.0.0.0:{port}");
+        let addr = format!("{bind}:{port}");
         let listener = match TcpListener::bind(&addr) {
             Ok(l) => l,
             Err(e) => {

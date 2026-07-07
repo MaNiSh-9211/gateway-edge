@@ -45,11 +45,17 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
 
+    // METRICS_PORT=0 disables the scrape server (use on Render — avoids port 9092
+    // being auto-detected as the web service port before OpenResty binds 8080).
     let metrics_port: u16 = std::env::var("METRICS_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9092);
-    metrics::spawn_metrics_server(metrics_port);
+    if metrics_port > 0 {
+        let bind = std::env::var("METRICS_BIND")
+            .unwrap_or_else(|_| "0.0.0.0".to_string());
+        metrics::spawn_metrics_server(&bind, metrics_port);
+    }
 
     let config_read_token = std::env::var("CONFIG_READ_TOKEN")
         .ok()

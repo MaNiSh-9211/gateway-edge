@@ -4,7 +4,24 @@ services:
     ports:
       - "8080:8080"
     environment:
-      GATEWAY_REGION: GLOBAL
+      REDIS_HOST: desired-vulture-82111.upstash.io
+      REDIS_PASSWORD: gQAAAAAAAUC_AAIgcDJjMGI2NTcwOTNjYzQ0MWQ3YjhlZjA1ZWRkZmJlZDNjOA
+      AUTH_CACHE_TTL_SECS: "30"
+      CONFIG_POLL_SECS: "5"
+      CONFIG_READ_TOKEN: RenderProd2026_CONFIG_7c8f2a1e9d4b6e3f0a5c8d1b7e4f9a2
+      CONTROL_PLANE_URL: https://gateway-control-plane-qjz2.onrender.com
+      FALLBACK_REGION: US
       GATEWAY_CONFIG_PATH: /etc/gateway/config.json
-      REDIS_HOST: redis
-      CONTROL_PLANE_URL: http://control-plane:8081
+      GATEWAY_REFUSE_INSECURE_SECRETS: "1"
+      GATEWAY_REGION: GLOBAL
+      JWT_SECRET: RenderProd2026_JWT_a8f3k2m9x7p4q1w6e5r0t8y2u3i7o9p1
+      LOG_LEVEL: warn
+      METRICS_PORT: "0"
+      REDIS_DB: "0"
+      REDIS_HOST: red-d584n06r433s73f2o7r0
+      REDIS_PASSWORD: ""
+      REDIS_PORT: "6379"
+      REVOCATION_FAIL_CLOSED: "1"
+      TLS_CERT_PATH: /etc/nginx/certs/server.crt
+      TLS_ENABLED: "false"
+      TLS_KEY_PATH: /etc/nginx/certs/server.key
