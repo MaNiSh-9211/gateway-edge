@@ -255,7 +255,10 @@ fn apply_secret_overrides(cfg: &mut GatewayConfig) {
                 None => {
                     cfg.cors = Some(CorsConfig {
                         allowed_origins: env_origins,
-                        ..Default::default()
+                        allow_credentials: true,
+                        allowed_methods: "GET, POST, PUT, PATCH, DELETE, OPTIONS".to_string(),
+                        allowed_headers: "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-CSRF-Token, X-Canary, X-Request-ID, traceparent".to_string(),
+                        max_age: 600,
                     });
                 }
             }
