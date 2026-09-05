@@ -1,29 +1,64 @@
-//! Gateway FFI Entrypoint — Ultra-Scale API Gateway v0.6
+//! Gateway FFI Entrypoint — Ultra-Scale API Gateway v0.7
 //!
 //! Hot-path execution order (per request, total ~300–600 ns):
 //!   1. backpressure::acquire()          — fail-fast if overloaded       (~5 ns)
 //!   2. waf::inspect()                   — URI + body + IP rate limit    (~200 ns)
 //!   3. auth::validate_token()           — alg/nbf/kid/revocation + LRU  (~50 ns cached)
 //!   4. router::route_request()          — path match + data residency   (~10 ns)
-//!   5. rate_limit::check_rate_limit()   — per-user shared-memory bucket (~15 ns)
+//!   5. rate_limit::check_rate_limit()   — local bucket + async Redis    (~20 ns)
 //!   6. load_balancing::select_upstream() — P2C + consistent hash + EMA   (~20 ns)
 //!   7. write_c_string()                 — fill output buffers           (~5 ns)
 //!
-//! New in v0.6:
-//!   - WAF body inspection (POST/PUT/PATCH)
-//!   - Per-IP rate limiting for anonymous traffic
-//!   - X-Request-ID generation and propagation
-//!   - JWT alg/nbf/kid/revocation enforcement
+//! New in v0.7:
+//!   - Distributed rate limiting: Redis EVALSHA fleet-wide counter sync
+//!   - Fail-open: Redis failure → local mmap bucket enforces (no request blocked)
+//!   - REDIS_URL env var support (Upstash full-URL format)
+//!   - New Prometheus metrics: rl_redis_syncs, rl_redis_sync_errors, rl_restarts
 
 mod auth;
 mod backpressure;
+mod baselines;
 mod cache;
 pub mod config;
+pub mod cors;
+pub mod health;
+mod debt;
+mod entropy;
 mod load_balancing;
+mod adaptive_concurrency;
+pub mod otlp;
+mod quota;
 mod rate_limit;
+pub mod redis_cb;
+pub mod revocation;
 mod router;
+pub mod sentinel;
+pub mod single_flight;
 pub mod telemetry;
+mod validate;
 mod waf;
+
+/// FFI: packed CORS headers for this request's Origin ('' = deny/disabled).
+/// # Safety
+/// `origin_ptr` must be a valid C string or NULL; `buf` writable for `len`.
+#[no_mangle]
+pub unsafe extern "C" fn get_cors_headers(
+    origin_ptr: *const c_char,
+    buf: *mut c_char,
+    len: usize,
+) -> i32 {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    let origin = if origin_ptr.is_null() {
+        ""
+    } else {
+        std::str::from_utf8(CStr::from_ptr(origin_ptr).to_bytes()).unwrap_or("")
+    };
+    let packed = cors::packed_headers(origin);
+    write_c_string(&packed, buf, len);
+    packed.len().min(len.saturating_sub(1)) as i32
+}
 
 // Re-export for external consumers / tests.
 pub use load_balancing::circuit_breaker;
@@ -32,12 +67,16 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use waf::WafDecision;
 
 // ── Request ID counter ────────────────────────────────────────────────────────
 
 /// Monotonic per-worker request counter for X-Request-ID generation
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Insecure secret warning deduplication: prints at most once per worker process
+static INSECURE_WARNING_PRINTED: OnceLock<()> = OnceLock::new();
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -47,34 +86,41 @@ pub extern "C" fn init_extension() {
     warn_insecure_secrets();
     config::start_config_sync();
     telemetry::start_telemetry_sync();
+    rate_limit::start_rl_redis_sync();
+    revocation::start_sync();
+    health::start_active_checks();
+    sentinel::start_sentinel();
+    otlp::start();
 }
 
 /// Log a loud warning when known dev/default secrets are in use.
 /// Set `GATEWAY_REFUSE_INSECURE_SECRETS=1` to abort worker startup in prod.
 fn warn_insecure_secrets() {
-    const DEV_SECRETS: &[&str] = &[
-        "super_secret_key_for_hmac_sha256_change_in_prod",
-        "super_secret_key_for_hmac_sha256",
-        "default_secret",
-        "change_me_use_a_long_random_secret_at_least_32_chars",
-    ];
-    let secret = std::env::var("JWT_SECRET").unwrap_or_default();
-    let insecure = secret.is_empty()
-        || DEV_SECRETS.iter().any(|d| secret == *d);
-    if !insecure {
-        return;
-    }
-    eprintln!(
-        "gateway: WARNING — JWT_SECRET is empty or a known dev/default value; \
-         rotate before production (ADR-0013, ADR-0041)"
-    );
-    if std::env::var("GATEWAY_REFUSE_INSECURE_SECRETS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
-        eprintln!("gateway: FATAL — GATEWAY_REFUSE_INSECURE_SECRETS=1 and JWT_SECRET is insecure");
-        std::process::abort();
-    }
+    let _ = INSECURE_WARNING_PRINTED.get_or_init(|| {
+        const DEV_SECRETS: &[&str] = &[
+            "super_secret_key_for_hmac_sha256_change_in_prod",
+            "super_secret_key_for_hmac_sha256",
+            "default_secret",
+            "change_me_use_a_long_random_secret_at_least_32_chars",
+        ];
+        let secret = std::env::var("JWT_SECRET").unwrap_or_default();
+        let insecure = secret.is_empty()
+            || DEV_SECRETS.iter().any(|d| secret == *d);
+        if !insecure {
+            return;
+        }
+        eprintln!(
+            "gateway: WARNING — JWT_SECRET is empty or a known dev/default value; \
+             rotate before production (ADR-0013, ADR-0041)"
+        );
+        if std::env::var("GATEWAY_REFUSE_INSECURE_SECRETS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            eprintln!("gateway: FATAL — GATEWAY_REFUSE_INSECURE_SECRETS=1 and JWT_SECRET is insecure");
+            std::process::abort();
+        }
+    });
 }
 
 /// Called after each request from NGINX `log_by_lua_block`.
@@ -97,6 +143,7 @@ pub unsafe extern "C" fn report_telemetry(
     upstream_ptr: *const c_char,
 ) {
     telemetry::record_request(status, latency_us);
+    otlp::record_request(status, latency_us as u64);
 
     let upstream = if !upstream_ptr.is_null() {
         CStr::from_ptr(upstream_ptr).to_str().unwrap_or("").to_string()
@@ -106,6 +153,12 @@ pub unsafe extern "C" fn report_telemetry(
 
     if !upstream.is_empty() {
         load_balancing::record_upstream_latency(&upstream, latency_us as u64);
+        // Latency Debt Ledger (ADR-0077): record against tier budget.
+        let budget_us = match tier_budget_us() {
+            Some(b) => b,
+            None => 60_000_000, // normal tier default
+        };
+        debt::record_observation(&upstream, latency_us as u64, budget_us);
         if status >= 500 {
             load_balancing::record_failure_for(&upstream);
         } else {
@@ -116,6 +169,13 @@ pub unsafe extern "C" fn report_telemetry(
     } else {
         load_balancing::record_success();
     }
+}
+
+/// Tier budget in microseconds for latency debt tracking (ADR-0077).
+fn tier_budget_us() -> Option<u64> {
+    std::env::var("DEBT_BUDGET_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 /// Release the concurrency (backpressure) slot held by an admitted request.
@@ -173,6 +233,8 @@ pub unsafe extern "C" fn process_request(
     body_ptr:         *const c_char,
     body_len:         usize,
     client_ip_ptr:    *const c_char,
+    canary_hint_ptr:  *const c_char,
+    content_type_ptr: *const c_char,
     region_out_ptr:   *mut c_char,
     region_out_len:   usize,
     upstream_out_ptr: *mut c_char,
@@ -183,6 +245,8 @@ pub unsafe extern "C" fn process_request(
     user_id_out_len:  usize,
     home_region_out_ptr: *mut c_char,
     home_region_out_len: usize,
+    tier_out_ptr:     *mut c_char,
+    tier_out_len:     usize,
 ) -> i32 {
     // 0. Backpressure
     if !backpressure::acquire() {
@@ -214,6 +278,17 @@ pub unsafe extern "C" fn process_request(
     };
     let client_ip = if !client_ip_ptr.is_null() {
         std::str::from_utf8(CStr::from_ptr(client_ip_ptr).to_bytes()).unwrap_or("")
+    } else {
+        ""
+    };
+    // Canary stickiness hint (header/cookie value computed in Lua, ADR-0063).
+    let canary_hint = if !canary_hint_ptr.is_null() {
+        std::str::from_utf8(CStr::from_ptr(canary_hint_ptr).to_bytes()).unwrap_or("")
+    } else {
+        ""
+    };
+    let content_type = if !content_type_ptr.is_null() {
+        std::str::from_utf8(CStr::from_ptr(content_type_ptr).to_bytes()).unwrap_or("")
     } else {
         ""
     };
@@ -264,21 +339,64 @@ pub unsafe extern "C" fn process_request(
         }
     };
 
+    // ── 4a. Sentinel Mode: shed anonymous traffic at GUARDED+ (ADR-0071) ──
+    // Infrastructure paths (/health /ready /metrics /healthz) are matched by
+    // their own nginx locations and never reach this hot path.
+    if sentinel::shed_anonymous() && identity.is_none() {
+        eprintln!(
+            "[sentinel] L{} shedding anonymous request {}",
+            sentinel::level(),
+            route_path
+        );
+        backpressure::release();
+        return 503;
+    }
+
+    // Timeout-policy tier for nginx's matching internal location (ADR-0062).
+    if !tier_out_ptr.is_null() {
+        write_c_string(&resolved.tier, tier_out_ptr, tier_out_len);
+    }
+
+    // ── 4b. Per-route body validation (ADR-0064) ───────────────────────────
+    if let Some(policy) = resolved.validation.as_deref() {
+        match validate::validate_body(policy, content_type, &body) {
+            Ok(()) => {}
+            Err(v) => {
+                let (status, reason) = v.response();
+                eprintln!(
+                    "[validate] reject {status} {reason} uri={}",
+                    path.split('?').next().unwrap_or(path)
+                );
+                backpressure::release();
+                return status as i32;
+            }
+        }
+    }
     // 4. Auth enforcement
     if service.require_auth && identity.is_none() {
         backpressure::release();
         return 401;
     }
 
-    // 5. Per-user rate limiting
+    // 5. Per-user rate limiting — runs BEFORE quota so requests rejected for
+    //    burst rate never consume the daily allowance (ADR-0066 flow fix).
     let user_key = identity.as_ref().map(|id| id.user_id.as_str());
     if !rate_limit::check_rate_limit(service.rate_limit_max, user_key) {
         backpressure::release();
         return 429;
     }
 
+    // 5b. Per-user daily quota (ADR-0066) — authenticated, admitted traffic.
+    if let (Some(id), Some(q)) = (identity.as_ref(), service.quota.as_ref()) {
+        if !quota::check_quota(&service.name, &id.user_id, q) {
+            eprintln!("[quota] {}/{} exceeded daily limit {}", service.name, id.user_id, q.daily_limit);
+            backpressure::release();
+            return 429;
+        }
+    }
+
     // 6. Load balancing
-    match load_balancing::select_upstream(Some(service), &resolved.region, user_key) {
+    match load_balancing::select_upstream(Some(service), &resolved.region, user_key, canary_hint) {
         Some(upstream_name) => {
             write_c_string(&resolved.region, region_out_ptr, region_out_len);
             if !upstream_out_ptr.is_null() {
