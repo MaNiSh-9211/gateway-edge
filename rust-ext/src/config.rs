@@ -31,6 +31,22 @@ pub struct Upstream {
     pub address: String,
     #[serde(default)]
     pub weight: usize,
+    /// Version label for canary routing (ADR-0063), e.g. "canary" | "stable".
+    #[serde(default)]
+    pub version: String,
+}
+
+/// Canary rollout policy (ADR-0063). Absent = whole pool treated as stable.
+/// Stickiness convention: header `X-Canary` or cookie `gateway_canary` set to
+/// the policy version pins that client to canary members.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CanaryPolicy {
+    pub version: String,
+    #[serde(default)]
+    pub percent: u32,
+}
+impl CanaryPolicy {
+    pub fn effective_percent(&self) -> u32 { self.percent.min(100) }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -39,6 +55,21 @@ pub struct Route {
     pub service_name: String,
     #[serde(default)]
     pub strip_prefix: bool,
+    /// Timeout-policy tier (ADR-0062): "fast" | "normal" | "slow".
+    #[serde(default)]
+    pub tier: String,
+    /// Per-route body validation policy (ADR-0064). Absent = no validation.
+    #[serde(default)]
+    pub validation: Option<crate::validate::ValidationConfig>,
+}
+
+impl Route {
+    pub fn effective_tier(&self) -> &str {
+        match self.tier.as_str() {
+            "fast" | "slow" => self.tier.as_str(),
+            _ => "normal",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -47,7 +78,69 @@ pub struct ServiceConfig {
     pub rate_limit_max: usize,
     pub regional_upstreams: HashMap<String, Vec<Upstream>>,
     pub require_auth: bool,
+    #[serde(default)]
+    pub canary: Option<CanaryPolicy>,
+    /// Per-user daily quota (ADR-0066). Absent = unlimited.
+    #[serde(default)]
+    pub quota: Option<QuotaPolicy>,
 }
+
+/// Daily per-user request ceiling (ADR-0066).
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuotaPolicy {
+    pub daily_limit: u64,
+    /// Grace borrowing (ADR-0073): allow up to this % of the daily limit as
+    /// borrowed requests once the limit is exhausted, instead of hard-429ing.
+    /// 0 = strict cut-off. Borrowed usage is counted in QUOTA_BORROWED_TOTAL.
+    #[serde(default)]
+    pub borrow_percent: u32,
+}
+
+/// Dynamic CORS policy (ADR-0068) — distributed via config hot-reload so
+/// origins change without redeploying the gateway.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CorsConfig {
+    /// Exact origins, or "*" for wildcard. Empty list = deny all CORS.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default = "ct_true")]
+    pub allow_credentials: bool,
+    #[serde(default = "ct_methods")]
+    pub allowed_methods: String,
+    #[serde(default = "ct_headers")]
+    pub allowed_headers: String,
+    #[serde(default = "ct_max_age")]
+    pub max_age: u32,
+}
+fn ct_true() -> bool { true }
+fn ct_methods() -> String { "GET, POST, PUT, PATCH, DELETE, OPTIONS".to_string() }
+fn ct_headers() -> String {
+    "Content-Type, Authorization, X-Requested-With, Accept, Origin, X-CSRF-Token, X-Canary, X-Request-ID, traceparent".to_string()
+}
+fn ct_max_age() -> u32 { 600 }
+
+/// Active health-check policy (ADR-0061). Absent = disabled.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HealthCheckConfig {
+    #[serde(default = "hc_true")]
+    pub enabled: bool,
+    #[serde(default = "hc_path")]
+    pub path: String,
+    #[serde(default = "hc_interval")]
+    pub interval_secs: u64,
+    #[serde(default = "hc_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "hc_unhealthy")]
+    pub unhealthy_threshold: u32,
+    #[serde(default = "hc_healthy")]
+    pub healthy_threshold: u32,
+}
+fn hc_true() -> bool { true }
+fn hc_path() -> String { "/health".to_string() }
+fn hc_interval() -> u64 { 10 }
+fn hc_timeout() -> u64 { 2_000 }
+fn hc_unhealthy() -> u32 { 3 }
+fn hc_healthy() -> u32 { 2 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct GatewayConfig {
@@ -78,6 +171,14 @@ pub struct GatewayConfig {
 
     pub services: HashMap<String, ServiceConfig>,
     pub routes: Vec<Route>,
+
+    /// Active upstream health probing (ADR-0061). None = disabled.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
+
+    /// Dynamic CORS policy (ADR-0068). None = edge emits no CORS headers.
+    #[serde(default)]
+    pub cors: Option<CorsConfig>,
 }
 
 fn default_secret() -> String { "default_secret".to_string() }
@@ -95,6 +196,8 @@ impl Default for GatewayConfig {
             expected_audience: default_audience(),
             services: HashMap::new(),
             routes: Vec::new(),
+            health_check: None,
+            cors: None,
         }
     }
 }
@@ -129,6 +232,33 @@ fn apply_secret_overrides(cfg: &mut GatewayConfig) {
     if let Ok(keys_json) = std::env::var("JWT_KEYS") {
         if let Some(keys) = parse_jwt_keys(&keys_json) {
             cfg.jwt_keys = keys;
+        }
+    }
+    // CORS_ALLOWED_ORIGINS: comma-separated list of origins to allow.
+    // Merges with (or creates) the cors section from the control plane config.
+    // Example: CORS_ALLOWED_ORIGINS=https://app1.com,https://app2.com
+    if let Ok(origins_csv) = std::env::var("CORS_ALLOWED_ORIGINS") {
+        let env_origins: Vec<String> = origins_csv
+            .split(',')
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+            .collect();
+        if !env_origins.is_empty() {
+            match cfg.cors.as_mut() {
+                Some(cors) => {
+                    for origin in &env_origins {
+                        if !cors.allowed_origins.iter().any(|o| o.eq_ignore_ascii_case(origin)) {
+                            cors.allowed_origins.push(origin.clone());
+                        }
+                    }
+                }
+                None => {
+                    cfg.cors = Some(CorsConfig {
+                        allowed_origins: env_origins,
+                        ..Default::default()
+                    });
+                }
+            }
         }
     }
 }
@@ -252,8 +382,39 @@ mod tests {
             path_prefix: "/".into(),
             service_name: "s".into(),
             strip_prefix: false,
+            tier: String::new(),
+            validation: None,
         });
         assert!(is_config_ready_for(&cfg));
+    }
+
+    #[test]
+    fn cors_env_var_merges_into_config() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "https://a.com, https://b.com");
+        let mut cfg = GatewayConfig::default();
+        assert!(cfg.cors.is_none());
+        apply_secret_overrides(&mut cfg);
+        let cors = cfg.cors.unwrap();
+        assert_eq!(cors.allowed_origins.len(), 2);
+        assert!(cors.allowed_origins.contains(&"https://a.com".to_string()));
+        assert!(cors.allowed_origins.contains(&"https://b.com".to_string()));
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    fn cors_env_var_appends_to_existing() {
+        std::env::set_var("CORS_ALLOWED_ORIGINS", "https://new.com");
+        let mut cfg = GatewayConfig::default();
+        cfg.cors = Some(CorsConfig {
+            allowed_origins: vec!["https://existing.com".to_string()],
+            ..Default::default()
+        });
+        apply_secret_overrides(&mut cfg);
+        let cors = cfg.cors.unwrap();
+        assert_eq!(cors.allowed_origins.len(), 2);
+        assert!(cors.allowed_origins.contains(&"https://existing.com".to_string()));
+        assert!(cors.allowed_origins.contains(&"https://new.com".to_string()));
+        std::env::remove_var("CORS_ALLOWED_ORIGINS");
     }
 }
 
