@@ -86,7 +86,7 @@ local function apply_cors()
     local parts = {}
     local pos = 1
     while true do
-        local s, e = packed:find("\31", pos, true)
+        local s, e = packed:find("\x1f", pos, true)
         if not s then parts[#parts + 1] = packed:sub(pos); break end
         parts[#parts + 1] = packed:sub(pos, s - 1)
         pos = e + 1
