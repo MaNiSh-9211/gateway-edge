@@ -261,6 +261,25 @@ fn apply_secret_overrides(cfg: &mut GatewayConfig) {
             }
         }
     }
+    // UPSTREAM_<SERVICE>: override upstream addresses per service.
+    // In Docker Compose the control plane uses internal DNS names (uam-backend:8080).
+    // In production (Render, K8s) each service has a public URL.
+    // Set UPSTREAM_UAM_AUTH=https://uam-backend.onrender.com:443 to redirect
+    // all uam-auth traffic to that URL. Applies to ALL regions for the service.
+    // Example: UPSTREAM_UAM_AUTH=https://uam-backend.onrender.com:443
+    for (service_name, service) in cfg.services.iter_mut() {
+        let env_key = format!("UPSTREAM_{}", service_name.to_uppercase().replace('-', "_"));
+        if let Ok(upstream_url) = std::env::var(&env_key) {
+            if !upstream_url.is_empty() {
+                for (_region, upstreams) in service.regional_upstreams.iter_mut() {
+                    for upstream in upstreams.iter_mut() {
+                        upstream.address = upstream_url.clone();
+                    }
+                }
+                eprintln!("[config] upstream override: {} → {}", service_name, upstream_url);
+            }
+        }
+    }
 }
 
 /// Parse the `JWT_KEYS` env var: a JSON object mapping `kid` → HMAC secret,
@@ -415,6 +434,31 @@ mod tests {
         assert!(cors.allowed_origins.contains(&"https://existing.com".to_string()));
         assert!(cors.allowed_origins.contains(&"https://new.com".to_string()));
         std::env::remove_var("CORS_ALLOWED_ORIGINS");
+    }
+
+    #[test]
+    fn upstream_env_var_overrides_service_address() {
+        std::env::set_var("UPSTREAM_UAM_AUTH", "https://uam-backend.onrender.com:443");
+        let mut cfg = GatewayConfig::default();
+        let mut regional = HashMap::new();
+        regional.insert("US".to_string(), vec![Upstream {
+            name: "uam-backend".to_string(),
+            address: "uam-backend:8080".to_string(),
+            weight: 10,
+            version: String::new(),
+        }]);
+        cfg.services.insert("uam-auth".to_string(), ServiceConfig {
+            name: "uam-auth".to_string(),
+            rate_limit_max: 2000,
+            regional_upstreams: regional,
+            require_auth: false,
+            canary: None,
+            quota: None,
+        });
+        apply_secret_overrides(&mut cfg);
+        let addr = &cfg.services["uam-auth"].regional_upstreams["US"][0].address;
+        assert_eq!(addr, "https://uam-backend.onrender.com:443");
+        std::env::remove_var("UPSTREAM_UAM_AUTH");
     }
 }
 
