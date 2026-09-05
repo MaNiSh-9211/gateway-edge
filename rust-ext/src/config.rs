@@ -98,7 +98,7 @@ pub struct QuotaPolicy {
 
 /// Dynamic CORS policy (ADR-0068) — distributed via config hot-reload so
 /// origins change without redeploying the gateway.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct CorsConfig {
     /// Exact origins, or "*" for wildcard. Empty list = deny all CORS.
     #[serde(default)]
