@@ -101,6 +101,9 @@ local function apply_cors()
         ngx.header["Access-Control-Allow-Methods"] = parts[2]
         ngx.header["Access-Control-Allow-Headers"] = parts[3]
         ngx.header["Access-Control-Max-Age"] = parts[4]
+        if parts[5] == "true" then
+            ngx.header["Access-Control-Allow-Credentials"] = "true"
+        end
         ngx.status = 204
         ngx.header["Content-Length"] = "0"
         return ngx.exit(204)
