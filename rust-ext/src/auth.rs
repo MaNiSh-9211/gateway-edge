@@ -83,70 +83,7 @@ thread_local! {
         RefCell::new(LruCache::new(NonZeroUsize::new(8_192).unwrap()));
 }
 
-// ── Revocation list ───────────────────────────────────────────────────────────
-
-/// Result of a revocation-list lookup against Redis.
-enum RevocationStatus {
-    NotRevoked,
-    Revoked,
-    /// Redis unreachable or timed out — policy depends on `REVOCATION_FAIL_CLOSED`.
-    Unavailable,
-}
-
-/// Result of a token-version floor lookup against Redis.
-enum TokenVersionStatus {
-    Valid,
-    Stale,
-    Unavailable,
-}
-
-fn token_version_key(user_id: &str) -> String {
-    format!("gateway:user:tv:{user_id}")
-}
-
-/// Pure decision logic for token-version validation (unit-tested).
-fn token_version_matches(stored: Option<u64>, token_tv: Option<u64>) -> bool {
-    match stored {
-        None => true,
-        Some(expected) => token_tv == Some(expected),
-    }
-}
-
-fn check_token_version(user_id: &str, tv: Option<u64>) -> TokenVersionStatus {
-    let key = token_version_key(user_id);
-
-    REDIS_CONN.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        for _attempt in 0..2 {
-            if guard.is_none() {
-                match open_redis_connection() {
-                    Some(c) => *guard = Some(c),
-                    None => return TokenVersionStatus::Unavailable,
-                }
-            }
-            let con = match guard.as_mut() {
-                Some(c) => c,
-                None => return TokenVersionStatus::Unavailable,
-            };
-            let result: redis::RedisResult<Option<String>> = redis::cmd("GET").arg(&key).query(con);
-            match result {
-                Ok(None) => return TokenVersionStatus::Valid,
-                Ok(Some(raw)) => {
-                    let stored = raw.parse::<u64>().unwrap_or(0);
-                    return if token_version_matches(Some(stored), tv) {
-                        TokenVersionStatus::Valid
-                    } else {
-                        TokenVersionStatus::Stale
-                    };
-                }
-                Err(_) => {
-                    *guard = None;
-                }
-            }
-        }
-        TokenVersionStatus::Unavailable
-    })
-}
+// ── Revocation / token-version (ADR-0054 — zero hot-path Redis) ─────────────
 
 fn revocation_fail_closed() -> bool {
     std::env::var("REVOCATION_FAIL_CLOSED")
@@ -182,7 +119,7 @@ fn effective_cache_expiry(token_exp: u64, now: u64, ttl: u64) -> u64 {
 
 /// Build the Redis connection URL. Supports ACL auth and TLS (`rediss://`).
 /// Set `REDIS_TLS=1` for managed Redis with in-transit encryption (ADR-0028).
-fn redis_url() -> String {
+pub(crate) fn redis_url() -> String {
     let scheme = if std::env::var("REDIS_TLS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -237,70 +174,27 @@ fn revocation_keys(token: &str, jti: Option<&str>) -> Vec<String> {
     keys
 }
 
-/// TCP connect timeout. Kept tight so a dead Redis never stalls the hot path.
-const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
-/// Per-command read/write timeout. Must be non-zero (zero is an error in the
-/// redis crate's `set_*_timeout`).
-const REDIS_IO_TIMEOUT: Duration = Duration::from_millis(50);
-
-thread_local! {
-    /// Per-worker persistent Redis connection for revocation lookups.
-    ///
-    /// Previously every cache miss did `Client::open` + a fresh TCP handshake,
-    /// then dropped the connection — connection churn that wastes a round trip
-    /// per request and can exhaust sockets/FDs under load. We keep one
-    /// connection per worker thread and reconnect only when a command fails.
-    static REDIS_CONN: RefCell<Option<redis::Connection>> = const { RefCell::new(None) };
+fn redis_timeout_ms() -> u64 {
+    std::env::var("REDIS_AUTH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.clamp(5, 1000))
+        .unwrap_or(50)
 }
 
-/// Establish a new Redis connection with bounded connect + I/O timeouts.
-fn open_redis_connection() -> Option<redis::Connection> {
+/// Establish a new Redis connection with bounded connect + I/O timeouts (§14).
+/// Used by the background revocation-snapshot sync (ADR-0054) — never on the
+/// request hot path.
+pub(crate) fn open_redis_connection() -> Option<redis::Connection> {
+    let timeout = Duration::from_millis(redis_timeout_ms());
     let client = redis::Client::open(redis_url().as_str()).ok()?;
     let con = client
-        .get_connection_with_timeout(REDIS_CONNECT_TIMEOUT)
+        .get_connection_with_timeout(timeout)
         .ok()?;
-    // Bound every command so a hung server can't block the request thread.
-    let _ = con.set_read_timeout(Some(REDIS_IO_TIMEOUT));
-    let _ = con.set_write_timeout(Some(REDIS_IO_TIMEOUT));
+    // Bound every command so a hung server can't block the caller (§14).
+    let _ = con.set_read_timeout(Some(timeout));
+    let _ = con.set_write_timeout(Some(timeout));
     Some(con)
-}
-
-/// Check if a token is in the Redis revocation list.
-/// Called on every cache miss — never on cache hit (performance).
-///
-/// Uses a single `EXISTS k1 k2 ...` round trip (O(1) per key, one RTT) so the
-/// jti-based and token-hash keys are both consulted without extra latency, over
-/// a reused per-worker connection. On a command error the connection is dropped
-/// and re-established exactly once (handles Redis restarts / idle drops).
-fn check_revocation(token: &str, jti: Option<&str>) -> RevocationStatus {
-    let keys = revocation_keys(token, jti);
-
-    REDIS_CONN.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        for _attempt in 0..2 {
-            if guard.is_none() {
-                match open_redis_connection() {
-                    Some(c) => *guard = Some(c),
-                    None => return RevocationStatus::Unavailable, // can't connect
-                }
-            }
-            let con = match guard.as_mut() {
-                Some(c) => c,
-                None => return RevocationStatus::Unavailable,
-            };
-            let result: redis::RedisResult<i64> =
-                redis::cmd("EXISTS").arg(&keys).query(con);
-            match result {
-                Ok(0) => return RevocationStatus::NotRevoked,
-                Ok(_) => return RevocationStatus::Revoked,
-                Err(_) => {
-                    // Likely a broken/stale connection — drop and retry once.
-                    *guard = None;
-                }
-            }
-        }
-        RevocationStatus::Unavailable
-    })
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -321,22 +215,26 @@ pub fn validate_token(auth_header: &str) -> Option<UserIdentity> {
     let token = auth_header.strip_prefix("Bearer ")?;
     let now   = now_secs();
 
+    // ── 0. Fail-closed guard on a stale snapshot (ADR-0054) ──────────────────
+    // A worker cut off from Redis must not serve on infinitely-stale auth data
+    // when the operator asked for fail-closed. Fresh snapshots are trusted.
+    if revocation_fail_closed() && crate::revocation::snapshot_stale() {
+        return None;
+    }
+
     // ── 1. LRU cache lookup ───────────────────────────────────────────────────
     let cached = TOKEN_CACHE.with(|c| c.borrow_mut().get(token).cloned());
     if let Some(entry) = cached {
         if entry.expires_at > now {
-            // Token-version floor can change without this JWT changing (password reset).
-            // Re-check on every request, including cache hits.
-            match check_token_version(&entry.identity.user_id, entry.tv) {
-                TokenVersionStatus::Stale => {
-                    TOKEN_CACHE.with(|c| c.borrow_mut().pop(token));
-                    return None;
-                }
-                TokenVersionStatus::Unavailable if revocation_fail_closed() => return None,
-                TokenVersionStatus::Valid | TokenVersionStatus::Unavailable => {
-                    return Some(entry.identity);
-                }
+            // Token-version floor can change without this JWT changing (password
+            // reset). Checked against the LOCAL snapshot — no Redis round trip.
+            if crate::revocation::tv_status(&entry.identity.user_id, entry.tv)
+                == crate::revocation::TvStatus::Stale
+            {
+                TOKEN_CACHE.with(|c| c.borrow_mut().pop(token));
+                return None;
             }
+            return Some(entry.identity);
         }
         TOKEN_CACHE.with(|c| c.borrow_mut().pop(token));
     }
@@ -419,11 +317,9 @@ pub fn validate_token(auth_header: &str) -> Option<UserIdentity> {
         return None;
     }
 
-    // ── 7. Revocation check ───────────────────────────────────────────────────
-    match check_revocation(token, claims.jti.as_deref()) {
-        RevocationStatus::Revoked => return None,
-        RevocationStatus::Unavailable if revocation_fail_closed() => return None,
-        RevocationStatus::NotRevoked | RevocationStatus::Unavailable => {}
+    // ── 7. Revocation check — LOCAL snapshot, no Redis round trip (ADR-0054) ─
+    if crate::revocation::is_revoked(claims.jti.as_deref(), &token_hash_hex(token)) {
+        return None;
     }
 
     // ── 7b. Token-version floor (password reset / kill-all-sessions) ──────────
@@ -432,12 +328,11 @@ pub fn validate_token(auth_header: &str) -> Option<UserIdentity> {
     } else {
         claims.user_id.clone()
     };
-    if !raw_user_id_for_tv.is_empty() {
-        match check_token_version(&raw_user_id_for_tv, claims.tv) {
-            TokenVersionStatus::Stale => return None,
-            TokenVersionStatus::Unavailable if revocation_fail_closed() => return None,
-            TokenVersionStatus::Valid | TokenVersionStatus::Unavailable => {}
-        }
+    if !raw_user_id_for_tv.is_empty()
+        && crate::revocation::tv_status(&raw_user_id_for_tv, claims.tv)
+            == crate::revocation::TvStatus::Stale
+    {
+        return None;
     }
 
     // ── 8. Build identity and Sanitize (CRLF Injection Prevention) ────────────
@@ -566,8 +461,7 @@ mod tests {
     fn redis_timeouts_are_nonzero() {
         // The redis crate treats a zero Duration as an error in
         // set_read_timeout/set_write_timeout, so these must stay > 0.
-        assert!(!REDIS_CONNECT_TIMEOUT.is_zero());
-        assert!(!REDIS_IO_TIMEOUT.is_zero());
+        assert!(redis_timeout_ms() > 0);
     }
 
     #[test]
@@ -578,19 +472,6 @@ mod tests {
     #[test]
     fn test_constant_time_eq_different_lengths() {
         assert!(!constant_time_eq(b"hi", b"hello"));
-    }
-
-    #[test]
-    fn token_version_matches_when_no_floor_published() {
-        assert!(token_version_matches(None, None));
-        assert!(token_version_matches(None, Some(0)));
-    }
-
-    #[test]
-    fn token_version_rejects_missing_or_stale_claim_when_floor_exists() {
-        assert!(!token_version_matches(Some(1), None));
-        assert!(!token_version_matches(Some(1), Some(0)));
-        assert!(token_version_matches(Some(1), Some(1)));
     }
 
     #[test]
@@ -605,6 +486,9 @@ mod tests {
 
     #[test]
     fn test_redis_url_formats() {
+        // Hermetic: the host machine may export REDIS_* vars (they leak into
+        // every process), so clear all inputs before asserting URL assembly.
+        std::env::remove_var("REDIS_TLS");
         std::env::remove_var("REDIS_USERNAME");
         std::env::remove_var("REDIS_PASSWORD");
         std::env::set_var("REDIS_HOST", "redis");
